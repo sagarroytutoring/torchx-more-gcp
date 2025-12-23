@@ -102,6 +102,7 @@ class GCPBatchJob:
 class GCPBatchOpts(TypedDict, total=False):
     project: Optional[str]
     location: Optional[str]
+    job_def: Optional[str]
 
 
 class GCPBatchScheduler(Scheduler[GCPBatchOpts]):
@@ -178,116 +179,128 @@ class GCPBatchScheduler(Scheduler[GCPBatchOpts]):
         response = self._client.create_job(request=request)
         return f"{req.project}:{req.location}:{req.name}"
 
-    def _app_to_job(self, app: AppDef) -> "batch_v1.Job":
+    def _app_to_job(self, app: AppDef, job_def: Optional[str] = None) -> "batch_v1.Job":
         from google.cloud import batch_v1
 
         name = normalize_str(make_unique(app.name))
 
-        taskGroups = []
-        allocationPolicy = None
+        # Create Job
+        if job_def is not None:
+            job: batch_v1.Job = batch_v1.Job.from_json(job_def)
+        else:
+            job = batch_v1.Job()
 
-        # 1. Convert role to task
+        job.name = name
+        job.logs_policy = batch_v1.LogsPolicy(
+            destination=batch_v1.LogsPolicy.Destination.CLOUD_LOGGING,
+        )
+        job.labels.update({
+            LABEL_VERSION: torchx.__version__.replace(".", "-"),
+            LABEL_APP_NAME: name,
+        })
+
+        # Convert role to task
         # TODO implement retry_policy, mount conversion
         # NOTE: Supports only one role for now as GCP Batch supports only one TaskGroup
         # which is ok to start with as most components have only one role
-        for role_idx, role in enumerate(app.roles):
-            values = macros.Values(
-                img_root="",
-                app_id=name,
-                replica_id=str(0),
-                rank0_env=("BATCH_MAIN_NODE_HOSTNAME"),
-            )
-            role_dict = values.apply(role)
-            role_dict.env["TORCHX_ROLE_IDX"] = str(role_idx)
-            role_dict.env["TORCHX_ROLE_NAME"] = str(role.name)
+        if len(app.roles) == 0:
+            raise ValueError("AppDef must have at least one role defined")
+        elif len(app.roles) > 1:
+            raise ValueError(f"GCP Batch Scheduler currently supports only one role per AppDef, got {len(app.roles)}")
 
-            resource = role_dict.resource
-            res = batch_v1.ComputeResource()
-            cpu = resource.cpu
-            if cpu <= 0:
-                cpu = 1
-            MILLI = 1000
-            res.cpu_milli = cpu * MILLI
-            memMB = resource.memMB
-            if memMB < 0:
-                raise ValueError(
-                    f"memMB should to be set to a positive value, got {memMB}"
-                )
-            res.memory_mib = memMB
-
-            # TODO support named resources
-            # Using v100 as default GPU type as a100 does not allow changing count for now
-            # TODO See if there is a better default GPU type
-            if resource.gpu > 0:
-                if resource.gpu not in GPU_COUNT_TO_TYPE:
-                    raise ValueError(
-                        f"gpu should to be set to one of these values: {GPU_COUNT_TO_TYPE.keys()}"
-                    )
-                machineType = GPU_COUNT_TO_TYPE[resource.gpu]
-                allocationPolicy = batch_v1.AllocationPolicy(
-                    instances=[
-                        batch_v1.AllocationPolicy.InstancePolicyOrTemplate(
-                            install_gpu_drivers=True,
-                            policy=batch_v1.AllocationPolicy.InstancePolicy(
-                                machine_type=machineType,
-                            ),
-                        )
-                    ],
-                )
-                print(f"Using GPUs of type: {machineType}")
-
-            # Configure host firewall rules to accept ingress communication
-            config_network_runnable = batch_v1.Runnable(
-                script=batch_v1.Runnable.Script(
-                    text="/sbin/iptables -A INPUT -j ACCEPT"
-                )
-            )
-
-            runnable = batch_v1.Runnable(
-                container=batch_v1.Runnable.Container(
-                    image_uri=role_dict.image,
-                    commands=[role_dict.entrypoint] + role_dict.args,
-                    entrypoint="",
-                    # Configure docker to use the host network stack to communicate with containers/other hosts in the same network
-                    options="--net host",
-                )
-            )
-
-            ts = batch_v1.TaskSpec(
-                runnables=[config_network_runnable, runnable],
-                environment=batch_v1.Environment(variables=role_dict.env),
-                max_retry_count=role_dict.max_retries,
-                compute_resource=res,
-            )
-
-            task_env = [
-                batch_v1.Environment(variables={"TORCHX_REPLICA_IDX": str(i)})
-                for i in range(role_dict.num_replicas)
-            ]
-
-            tg = batch_v1.TaskGroup(
-                task_spec=ts,
-                task_count=role_dict.num_replicas,
-                task_count_per_node=1,
-                task_environments=task_env,
-                require_hosts_file=True,
-            )
-            taskGroups.append(tg)
-
-        # 2. Convert AppDef to Job
-        job = batch_v1.Job(
-            name=name,
-            task_groups=taskGroups,
-            allocation_policy=allocationPolicy,
-            logs_policy=batch_v1.LogsPolicy(
-                destination=batch_v1.LogsPolicy.Destination.CLOUD_LOGGING,
-            ),
-            # NOTE: GCP Batch does not allow label names with "."
-            labels={
-                LABEL_VERSION: torchx.__version__.replace(".", "-"),
-                LABEL_APP_NAME: name,
-            },
+        role_idx = 0
+        role = app.roles[role_idx]
+        values = macros.Values(
+            img_root="",
+            app_id=name,
+            replica_id=str(0),
+            rank0_env=("BATCH_MAIN_NODE_HOSTNAME"),
         )
+        role_dict = values.apply(role)
+        role_dict.env["TORCHX_ROLE_IDX"] = str(role_idx)
+        role_dict.env["TORCHX_ROLE_NAME"] = str(role.name)
+
+        # Populate TaskGroup
+        if not job.task_groups:
+            tg = batch_v1.TaskGroup()
+        elif len(job.task_groups) > 1:
+            raise ValueError(f"GCP Batch Scheduler currently supports only one TaskGroup per Job, got {len(job.task_groups)}")
+        else:
+            tg = job.task_groups[0]
+
+        tg.require_hosts_file = True
+        tg.task_count_per_node = 1
+        tg.task_count = role_dict.num_replicas
+
+        task_envs = tg.task_environments
+        if len(task_envs) == 1:
+            task_envs.extend([task_envs[0]] * (role_dict.num_replicas - 1))
+        elif not task_envs:
+            task_envs.extend([batch_v1.Environment()] * role_dict.num_replicas)
+        else:
+            raise ValueError(f"GCP Batch Scheduler currently supports either zero or one task_environments per TaskGroup, got {len(task_envs)}")
+
+        for i in range(role_dict.num_replicas):
+            task_env = task_envs[i]
+            task_env.variables["TORCHX_REPLICA_ID"] = str(i)
+
+        # Populate taskspec
+        ts = tg.task_spec
+        ts.max_retry_count = role_dict.max_retries
+        ts.environment.variables.update(role_dict.env)
+
+        resource = role_dict.resource
+        res = ts.compute_resource
+        cpu = resource.cpu
+        if cpu <= 0:
+            cpu = 1
+        MILLI = 1000
+        res.cpu_milli = cpu * MILLI
+        memMB = resource.memMB
+        if memMB < 0:
+            raise ValueError(
+                f"memMB should to be set to a positive value, got {memMB}"
+            )
+        res.memory_mib = memMB
+
+        # TODO support named resources
+        # Using v100 as default GPU type as a100 does not allow changing count for now
+        # TODO See if there is a better default GPU type
+        if resource.gpu > 0:
+            if resource.gpu not in GPU_COUNT_TO_TYPE:
+                raise ValueError(
+                    f"gpu should to be set to one of these values: {GPU_COUNT_TO_TYPE.keys()}"
+                )
+            machineType = GPU_COUNT_TO_TYPE[resource.gpu]
+            instances = job.allocation_policy.instances
+            if len(instances) > 1:
+                raise ValueError(f"GCP Batch Scheduler currently supports only one instance per Job, got {len(instances)}")
+            if instances:
+                instance = instances[0]
+            else:
+                instance = batch_v1.AllocationPolicy.InstancePolicyOrTemplate()
+                instances.append(instance)
+
+            instance.install_gpu_drivers = True
+            instance.policy.machine_type = machineType
+            print(f"Using GPUs of type: {machineType}")
+
+        runnables = ts.runnables
+        for runnable in runnables:
+            runnable.container.image_uri = role_dict.image
+            runnable.container.commands = [role_dict.entrypoint] + role_dict.args
+            runnable.container.entrypoint = ""
+            # Configure docker to use the host network stack to communicate with containers/other hosts in the same network
+            runnable.container.options = "--net host"
+
+        # Configure host firewall rules to accept ingress communication
+        config_network_runnable = batch_v1.Runnable(
+            script=batch_v1.Runnable.Script(
+                text="/sbin/iptables -A INPUT -j ACCEPT"
+            )
+        )
+        runnables.insert(0, config_network_runnable)
+
         return job
 
     def _get_project(self) -> str:
@@ -306,7 +319,7 @@ class GCPBatchScheduler(Scheduler[GCPBatchOpts]):
         loc = cfg.get("location")
         assert loc is not None and isinstance(loc, str), "location must be a str"
 
-        job = self._app_to_job(app)
+        job = self._app_to_job(app, cfg.job_def)
 
         # Convert JobDef + BatchOpts to GCPBatchJob
         req = GCPBatchJob(
