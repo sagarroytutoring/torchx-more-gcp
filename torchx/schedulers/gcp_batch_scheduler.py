@@ -204,7 +204,7 @@ class GCPBatchScheduler(Scheduler[GCPBatchOpts]):
         # NOTE: Supports only one role for now as GCP Batch supports only one TaskGroup
         # which is ok to start with as most components have only one role
         if len(app.roles) == 0:
-            raise ValueError("AppDef must have at least one role defined")
+            raise ValueError("AppDef must have one role defined")
         elif len(app.roles) > 1:
             raise ValueError(f"GCP Batch Scheduler currently supports only one role per AppDef, got {len(app.roles)}")
 
@@ -286,6 +286,9 @@ class GCPBatchScheduler(Scheduler[GCPBatchOpts]):
             print(f"Using GPUs of type: {machineType}")
 
         runnables = ts.runnables
+        if not runnables:
+            runnable = batch_v1.Runnable()
+            runnables.append(runnable)
         for runnable in runnables:
             runnable.container.image_uri = role_dict.image
             runnable.container.commands = [role_dict.entrypoint] + role_dict.args
@@ -319,7 +322,19 @@ class GCPBatchScheduler(Scheduler[GCPBatchOpts]):
         loc = cfg.get("location")
         assert loc is not None and isinstance(loc, str), "location must be a str"
 
-        job = self._app_to_job(app, cfg.job_def)
+        job_def = cfg.get("job_def")
+        assert job_def is None or isinstance(job_def, str), "job_def must be a str"
+
+        job_def_file = cfg.get("job_def_file")
+        assert job_def_file is None or isinstance(job_def_file, str), "job_def_file must be a str"
+
+        assert job_def_file is None or job_def is not None, "Only one of job_def or job_def_file should be provided"
+
+        if job_def_file is not None:
+            with open(job_def_file, "r") as f:
+                job_def = f.read()
+
+        job = self._app_to_job(app, job_def)
 
         # Convert JobDef + BatchOpts to GCPBatchJob
         req = GCPBatchJob(
@@ -343,6 +358,18 @@ class GCPBatchScheduler(Scheduler[GCPBatchOpts]):
             type_=str,
             default=DEFAULT_LOC,
             help=f"Name of the location to schedule the job in. Defaults to {DEFAULT_LOC}",
+        )
+        opts.add(
+            "job_def",
+            type_=str,
+            default=None,
+            help="JSON string to convert to batch job and use as the base job definition. Defaults to None",
+        )
+        opts.add(
+            "job_def_file",
+            type_=str,
+            default=None,
+            help="Path to JSON file to load and convert to batch job and use as the base job definition. Defaults to None",
         )
         return opts
 
