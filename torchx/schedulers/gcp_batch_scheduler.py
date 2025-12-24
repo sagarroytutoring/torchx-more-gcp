@@ -57,11 +57,11 @@ JOB_STATE: Dict[str, AppState] = {
 }
 
 GPU_COUNT_TO_TYPE: Dict[int, str] = {
-    1: "a2-highgpu-1g",
-    2: "a2-highgpu-2g",
-    4: "a2-highgpu-4g",
-    8: "a2-highgpu-8g",
-    16: "a2-highgpu-16g",
+    0: "c3-highmem-8",
+    1: "a3-highgpu-1g",
+    2: "a3-highgpu-2g",
+    4: "a3-highgpu-4g",
+    8: "a3-highgpu-8g"
 }
 
 GPU_TYPE_TO_COUNT: Dict[str, int] = {v: k for k, v in GPU_COUNT_TO_TYPE.items()}
@@ -179,6 +179,17 @@ class GCPBatchScheduler(Scheduler[GCPBatchOpts]):
         response = self._client.create_job(request=request)
         return f"{req.project}:{req.location}:{req.name}"
 
+    def _select_machine_type(self, resource: Resource) -> str:
+        # from google.cloud import compute_v1  # TODO: implement smarter machine type selection
+
+        # Using v100 as default GPU type as a100 does not allow changing count for now
+        # TODO See if there is a better default GPU type
+        if resource.gpu not in GPU_COUNT_TO_TYPE:
+            raise ValueError(
+                f"gpu should to be set to one of these values: {GPU_COUNT_TO_TYPE.keys()}"
+            )
+        return GPU_COUNT_TO_TYPE[resource.gpu]
+
     def _app_to_job(self, app: AppDef, job_def: Optional[str] = None) -> "batch_v1.Job":
         from google.cloud import batch_v1
 
@@ -264,26 +275,19 @@ class GCPBatchScheduler(Scheduler[GCPBatchOpts]):
         res.memory_mib = memMB
 
         # TODO support named resources
-        # Using v100 as default GPU type as a100 does not allow changing count for now
-        # TODO See if there is a better default GPU type
-        if resource.gpu > 0:
-            if resource.gpu not in GPU_COUNT_TO_TYPE:
-                raise ValueError(
-                    f"gpu should to be set to one of these values: {GPU_COUNT_TO_TYPE.keys()}"
-                )
-            machineType = GPU_COUNT_TO_TYPE[resource.gpu]
-            instances = job.allocation_policy.instances
-            if len(instances) > 1:
-                raise ValueError(f"GCP Batch Scheduler currently supports only one instance per Job, got {len(instances)}")
-            if instances:
-                instance = instances[0]
-            else:
-                instance = batch_v1.AllocationPolicy.InstancePolicyOrTemplate()
-                instances.append(instance)
+        machineType = self._select_machine_type(resource)
+        instances = job.allocation_policy.instances
+        if len(instances) > 1:
+            raise ValueError(f"GCP Batch Scheduler currently supports only one instance per Job, got {len(instances)}")
+        if instances:
+            instance = instances[0]
+        else:
+            instance = batch_v1.AllocationPolicy.InstancePolicyOrTemplate()
+            instances.append(instance)
 
-            instance.install_gpu_drivers = True
-            instance.policy.machine_type = machineType
-            print(f"Using GPUs of type: {machineType}")
+        instance.install_gpu_drivers = resource.gpu > 0
+        instance.policy.machine_type = machineType
+        print(f"Using machinetype: {machineType}")
 
         runnables = ts.runnables
         if not runnables:
@@ -328,7 +332,7 @@ class GCPBatchScheduler(Scheduler[GCPBatchOpts]):
         job_def_file = cfg.get("job_def_file")
         assert job_def_file is None or isinstance(job_def_file, str), "job_def_file must be a str"
 
-        assert job_def_file is None or job_def is not None, "Only one of job_def or job_def_file should be provided"
+        assert job_def_file is None or job_def is None, "Only one of job_def or job_def_file should be provided"
 
         if job_def_file is not None:
             with open(job_def_file, "r") as f:
@@ -363,13 +367,13 @@ class GCPBatchScheduler(Scheduler[GCPBatchOpts]):
             "job_def",
             type_=str,
             default=None,
-            help="JSON string to convert to batch job and use as the base job definition. Defaults to None",
+            help="JSON string to convert to batch job and use as the base job definition. Defaults to None. Cannot be used with job_def_file.",
         )
         opts.add(
             "job_def_file",
             type_=str,
             default=None,
-            help="Path to JSON file to load and convert to batch job and use as the base job definition. Defaults to None",
+            help="Path to JSON file to load and convert to batch job and use as the base job definition. Defaults to None. Cannot be used with job_def.",
         )
         return opts
 
